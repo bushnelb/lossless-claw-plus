@@ -81,12 +81,7 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
   "plugins": {
     "entries": {
       "lossless-claw": {
-        "enabled": true,
-        "config": {
-          "freshTailCount": 32,
-          "contextThreshold": 0.75,
-          "incrementalMaxDepth": -1
-        }
+        "enabled": true
       }
     }
   }
