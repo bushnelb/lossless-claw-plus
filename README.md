@@ -22,10 +22,67 @@ When a conversation grows beyond the model's context window, OpenClaw (just like
 3. **Condenses summaries** into higher-level nodes as they accumulate, forming a DAG (directed acyclic graph)
 4. **Assembles context** each turn by combining summaries + recent raw messages
 5. **Provides tools** (`lcm_grep`, `lcm_describe`, `lcm_expand`) so agents can search and recall details from compacted history
+6. **Active context management** — agents can collapse, tag, checkpoint, and organize their own context window in real-time
 
 Nothing is lost. Raw messages stay in the database. Summaries link back to their source messages. Agents can drill into any summary to recover the original detail.
 
 **It feels like talking to an agent that never forgets. Because it doesn't. In normal operation, you'll never need to think about compaction again.**
+
+## Active context management
+
+This fork extends LCM from a passive compaction engine into a full active context management system. Agents get direct control over their context window — collapsing stale content, organizing with tags, saving checkpoints, and maintaining a working memory scratchpad.
+
+### Tools overview
+
+| Tool | Purpose |
+|------|---------|
+| **lcm_grep** | Search compacted history (regex or full-text) |
+| **lcm_describe** | Inspect summaries, pointers, or files by ID |
+| **lcm_expand** | Traverse summary DAG to recover detail |
+| **lcm_expand_query** | Deep recall via delegated sub-agent expansion |
+| **lcm_collapse** | Collapse content into expandable pointers (~20 tokens each) |
+| **lcm_expand_active** | Restore collapsed pointers back to full content |
+| **lcm_scratchpad** | Working memory in the high-attention zone (end of context) |
+| **lcm_tidy** | Bulk context hygiene — collapse stale tool results |
+| **lcm_promote** | Move insights from pointers/summaries to scratchpad |
+| **lcm_tag** | Batch tag/status operations on pointers |
+| **lcm_budget** | Context composition breakdown (where tokens are spent) |
+| **lcm_checkpoint** | Save/restore context state snapshots |
+| **lcm_templates** | Reusable code/text snippets with `{{VAR}}` substitution |
+| **lcm_undo** | Roll back collapse/remove/replace operations |
+
+### Pointer lifecycle
+
+Collapsed content (pointers) follow a lifecycle:
+
+```
+active → reference → stale
+```
+
+- **active**: Important, currently relevant content. Protected from aggressive tidying.
+- **reference**: Background material. Available but not urgent.
+- **stale**: Outdated content. First to be cleaned up.
+
+### Tags and relationships
+
+Pointers can be tagged for categorization and discovery:
+
+```
+lcm_collapse(target: "last_tool", tags: ["galois", "B4"], status: "active")
+lcm_tag(action: "list", filterTags: ["galois"])
+lcm_describe(id: "ptr_xxx")  → shows related pointers via shared tags
+```
+
+This enables O(1) lookup for related content instead of O(n) guessing after compaction.
+
+### Progressive discovery
+
+Three levels of pointer inspection without expanding:
+
+1. **Glance**: Collapsed tag with label + tokens saved (always visible, free)
+2. **Peek**: `lcm_describe(id: "ptr_xxx")` — preview contents + stored data
+3. **Search**: `lcm_describe(id: "ptr_xxx", query: "term")` — search within collapsed content
+4. **Expand**: `lcm_expand_active(pointerId: "ptr_xxx")` — full restore to context
 
 ## Quick start
 
@@ -228,10 +285,20 @@ src/
     summary-store.ts        # Summary DAG persistence and context item management
     fts5-sanitize.ts        # FTS5 query sanitization
   tools/
-    lcm-grep-tool.ts        # lcm_grep tool implementation
-    lcm-describe-tool.ts    # lcm_describe tool implementation
-    lcm-expand-tool.ts      # lcm_expand tool (sub-agent only)
-    lcm-expand-query-tool.ts # lcm_expand_query tool (main agent wrapper)
+    lcm-grep-tool.ts        # lcm_grep — search compacted history
+    lcm-describe-tool.ts    # lcm_describe — inspect items + pointer peek
+    lcm-expand-tool.ts      # lcm_expand (sub-agent only)
+    lcm-expand-query-tool.ts # lcm_expand_query (main agent wrapper)
+    lcm-collapse-tool.ts    # lcm_collapse — collapse/remove/replace content
+    lcm-expand-active-tool.ts # lcm_expand_active — restore collapsed pointers
+    lcm-scratchpad-tool.ts  # lcm_scratchpad — working memory management
+    lcm-tidy-tool.ts        # lcm_tidy — bulk context hygiene
+    lcm-promote-tool.ts     # lcm_promote — move insights to scratchpad
+    lcm-tag-tool.ts         # lcm_tag — batch tag/status operations
+    lcm-budget-tool.ts      # lcm_budget — context composition breakdown
+    lcm-checkpoint-tool.ts  # lcm_checkpoint — save/restore context snapshots
+    lcm-templates-tool.ts   # lcm_templates — reusable text templates
+    lcm-undo-tool.ts        # lcm_undo — roll back mutating operations
     lcm-conversation-scope.ts # Conversation scoping utilities
     common.ts               # Shared tool utilities
 test/                       # Vitest test suite
