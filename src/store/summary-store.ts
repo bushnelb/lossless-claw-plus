@@ -1323,6 +1323,72 @@ export class SummaryStore {
     }
   }
 
+  /**
+   * Replace specific context items (by ordinal list) with a single pointer.
+   * Unlike replaceContextRangeWithPointer, this does NOT sweep items between
+   * the min and max ordinal — only the exact ordinals listed are removed.
+   * The pointer is inserted at the position of the first (lowest) ordinal.
+   */
+  async replaceContextItemsWithPointer(input: {
+    conversationId: number;
+    ordinals: number[];
+    pointerId: string;
+  }): Promise<void> {
+    const { conversationId, ordinals, pointerId } = input;
+
+    if (ordinals.length === 0) return;
+
+    const sorted = [...ordinals].sort((a, b) => a - b);
+    const insertAt = sorted[0];
+
+    this.db.exec("BEGIN");
+    try {
+      // Delete only the specific ordinals
+      const deleteStmt = this.db.prepare(
+        `DELETE FROM context_items
+         WHERE conversation_id = ? AND ordinal = ?`,
+      );
+      for (const ord of sorted) {
+        deleteStmt.run(conversationId, ord);
+      }
+
+      // Insert the pointer at the first ordinal position
+      this.db
+        .prepare(
+          `INSERT INTO context_items (conversation_id, ordinal, item_type, pointer_id)
+         VALUES (?, ?, 'pointer', ?)`,
+        )
+        .run(conversationId, insertAt, pointerId);
+
+      // Resequence ordinals (same two-pass negative-swap approach)
+      const items = this.db
+        .prepare(
+          `SELECT ordinal FROM context_items
+         WHERE conversation_id = ?
+         ORDER BY ordinal`,
+        )
+        .all(conversationId) as unknown as { ordinal: number }[];
+
+      const updateStmt = this.db.prepare(
+        `UPDATE context_items
+         SET ordinal = ?
+         WHERE conversation_id = ? AND ordinal = ?`,
+      );
+
+      for (let i = 0; i < items.length; i++) {
+        updateStmt.run(-(i + 1), conversationId, items[i].ordinal);
+      }
+      for (let i = 0; i < items.length; i++) {
+        updateStmt.run(i, conversationId, -(i + 1));
+      }
+
+      this.db.exec("COMMIT");
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
   async removeContextItemsInRange(
     conversationId: number,
     startOrdinal: number,
@@ -1335,7 +1401,7 @@ export class SummaryStore {
           `DELETE FROM context_items WHERE conversation_id = ? AND ordinal >= ? AND ordinal <= ?`,
         )
         .run(conversationId, startOrdinal, endOrdinal);
-      const changes = result.changes;
+      const changes = Number(result.changes);
 
       // Resequence ordinals
       const items = this.db

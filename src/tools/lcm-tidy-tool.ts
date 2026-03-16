@@ -10,6 +10,22 @@ function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }
 
+/** Truncate text to maxLen, appending "…" if truncated. */
+function truncate(text: string, maxLen: number): string {
+  if (text.length <= maxLen) return text;
+  return text.slice(0, maxLen - 1) + "…";
+}
+
+/** Message info resolved during candidate collection. */
+interface ResolvedMessage {
+  messageId: number;
+  ordinal: number;
+  tokens: number;
+  role: string;
+  toolName: string | null;
+  contentPreview: string;
+}
+
 const LcmTidySchema = Type.Object({
   keepRecentTurns: Type.Optional(
     Type.Number({
@@ -27,7 +43,7 @@ const LcmTidySchema = Type.Object({
   exclude: Type.Optional(
     Type.String({
       description:
-        "Pattern to exclude from tidy. Items whose content or label matches this substring (case-insensitive) will be preserved.",
+        "Pattern to exclude from tidy. Items whose content, tool name, or role matches this substring (case-insensitive) will be preserved.",
     }),
   ),
   maxTokensPerPointer: Type.Optional(
@@ -134,8 +150,8 @@ export function createLcmTidyTool(input: {
         return jsonResult({ collapsed: 0, tokensSaved: 0, pointersCreated: [], dryRun, message: "Nothing old enough to collapse." });
       }
 
-      // Step 4: Filter based on target
-      const collapsible: Array<{ index: number; ordinal: number; messageId: number; tokens: number }> = [];
+      // Step 4: Resolve all candidate messages and filter based on target + exclude
+      const collapsible: ResolvedMessage[] = [];
 
       for (let i = 0; i < candidates.length; i++) {
         const item = candidates[i];
@@ -150,35 +166,74 @@ export function createLcmTidyTool(input: {
         }
         // For "all", include all message items
 
-        // Exclusion filter: skip items matching the exclude pattern
-        if (exclude && msg.content.toLowerCase().includes(exclude)) {
-          continue;
+        // Resolve tool name from message parts (only for tool messages, to avoid unnecessary queries)
+        let toolName: string | null = null;
+        if (msg.role === "tool") {
+          const parts = await conversationStore.getMessageParts(item.messageId);
+          toolName = parts.find((p) => p.toolName)?.toolName ?? null;
+        }
+
+        // Exclusion filter: check content, tool name, AND role
+        if (exclude) {
+          const matchesContent = msg.content.toLowerCase().includes(exclude);
+          const matchesToolName = toolName ? toolName.toLowerCase().includes(exclude) : false;
+          const matchesRole = msg.role.toLowerCase().includes(exclude);
+          if (matchesContent || matchesToolName || matchesRole) {
+            continue;
+          }
         }
 
         const tokens = msg.tokenCount > 0 ? msg.tokenCount : estimateTokens(msg.content);
-        collapsible.push({ index: i, ordinal: item.ordinal, messageId: item.messageId, tokens });
+        collapsible.push({
+          messageId: item.messageId,
+          ordinal: item.ordinal,
+          tokens,
+          role: msg.role,
+          toolName,
+          contentPreview: truncate(msg.content.replace(/\n/g, " ").trim(), 80),
+        });
       }
 
       if (collapsible.length === 0) {
         return jsonResult({ collapsed: 0, tokensSaved: 0, pointersCreated: [], dryRun, message: "No collapsible items found." });
       }
 
-      // Step 5: Group collapsible items into ranges
-      // Allow gaps of up to 3 non-collapsible items between collapsible items
-      // This prevents 50+ individual pointers when tool results are interleaved with assistant msgs
+      // Step 5: Group collapsible items into semantically coherent ranges.
+      //
+      // In "tool_results" mode: group adjacent tool messages freely (gap ≤ 4 ordinals)
+      //   since they're all the same kind.
+      // In "all" mode: group by role category to avoid mixing conversation messages
+      //   with tool results. This keeps pointer labels meaningful and prevents
+      //   user/assistant exchanges from being bundled with unrelated tool output.
       const MAX_ORDINAL_GAP = 4;
-      const groups: Array<typeof collapsible> = [];
-      let currentGroup: typeof collapsible = [collapsible[0]];
+
+      type CollapsibleGroup = ResolvedMessage[];
+      const groups: CollapsibleGroup[] = [];
+
+      /** Classify a role into a grouping category */
+      function roleCategory(role: string): string {
+        if (role === "tool") return "tool";
+        return "conversation"; // user, assistant, system
+      }
+
+      let currentGroup: CollapsibleGroup = [collapsible[0]];
 
       for (let i = 1; i < collapsible.length; i++) {
         const prev = collapsible[i - 1];
         const curr = collapsible[i];
-        // Group if ordinals are close enough (allowing small gaps for interleaved messages)
-        if (curr.ordinal - prev.ordinal <= MAX_ORDINAL_GAP) {
-          currentGroup.push(curr);
-        } else {
+
+        // Break group on ordinal gap
+        const gapTooLarge = curr.ordinal - prev.ordinal > MAX_ORDINAL_GAP;
+
+        // In "all" mode, also break on role category change
+        const categoryChanged =
+          target === "all" && roleCategory(curr.role) !== roleCategory(prev.role);
+
+        if (gapTooLarge || categoryChanged) {
           groups.push(currentGroup);
           currentGroup = [curr];
+        } else {
+          currentGroup.push(curr);
         }
       }
       groups.push(currentGroup);
@@ -188,24 +243,14 @@ export function createLcmTidyTool(input: {
       const pointersCreated: string[] = [];
 
       if (dryRun) {
-        // Just calculate what would happen — account for ALL items in the ordinal range
+        // Preview what would happen — only count the actual collapsible items
+        // (no longer sweeping non-collapsible items caught in ordinal ranges)
         for (const group of groups) {
-          const startOrd = group[0].ordinal;
-          const endOrd = group[group.length - 1].ordinal;
-          // Count all context items in the ordinal range (including non-collapsible ones caught in the span)
-          const rangeItems = contextItems.filter(
-            (ci) => ci.ordinal >= startOrd && ci.ordinal <= endOrd && ci.itemType === "message",
-          );
-          let rangeTokens = 0;
-          for (const ri of rangeItems) {
-            if (ri.messageId != null) {
-              const m = await conversationStore.getMessageById(ri.messageId);
-              if (m) rangeTokens += m.tokenCount > 0 ? m.tokenCount : estimateTokens(m.content);
-            }
-          }
-          totalCollapsed += rangeItems.length;
-          totalTokensSaved += rangeTokens;
-          pointersCreated.push(`(dry run) ${rangeItems.length} items, ~${rangeTokens} tokens`);
+          const tokens = group.reduce((sum, item) => sum + item.tokens, 0);
+          totalCollapsed += group.length;
+          totalTokensSaved += tokens;
+          const label = buildGroupLabel(group, target);
+          pointersCreated.push(`(dry run) ${label}`);
         }
 
         return jsonResult({
@@ -221,55 +266,40 @@ export function createLcmTidyTool(input: {
       // If maxTokensPerPointer is set, split groups into subgroups that fit within the limit.
       for (let gi = groups.length - 1; gi >= 0; gi--) {
         const group = groups[gi];
-        const startOrdinal = group[0].ordinal;
-        const endOrdinal = group[group.length - 1].ordinal;
-        // Count ALL items in range for accurate token savings
-        const rangeItems = contextItems.filter(
-          (ci) => ci.ordinal >= startOrdinal && ci.ordinal <= endOrdinal && ci.itemType === "message",
-        );
-
-        // Gather per-item token info for potential splitting
-        const itemInfos: Array<{ messageId: number; ordinal: number; tokens: number }> = [];
-        for (const ri of rangeItems) {
-          if (ri.messageId != null) {
-            const m = await conversationStore.getMessageById(ri.messageId);
-            if (m) {
-              const tokens = m.tokenCount > 0 ? m.tokenCount : estimateTokens(m.content);
-              itemInfos.push({ messageId: ri.messageId, ordinal: ri.ordinal, tokens });
-            }
-          }
-        }
 
         // Split into subgroups if maxTokensPerPointer is set
-        const subgroups: Array<typeof itemInfos> = [];
-        if (maxTokensPerPointer && itemInfos.length > 0) {
-          let current: typeof itemInfos = [];
+        const subgroups: CollapsibleGroup[] = [];
+        if (maxTokensPerPointer && group.length > 0) {
+          let current: CollapsibleGroup = [];
           let currentTokens = 0;
-          for (const info of itemInfos) {
-            if (current.length > 0 && currentTokens + info.tokens > maxTokensPerPointer) {
+          for (const item of group) {
+            if (current.length > 0 && currentTokens + item.tokens > maxTokensPerPointer) {
               subgroups.push(current);
               current = [];
               currentTokens = 0;
             }
-            current.push(info);
-            currentTokens += info.tokens;
+            current.push(item);
+            currentTokens += item.tokens;
           }
           if (current.length > 0) subgroups.push(current);
         } else {
-          subgroups.push(itemInfos);
+          subgroups.push(group);
         }
 
         // Process subgroups in reverse order to preserve ordinals
         for (let si = subgroups.length - 1; si >= 0; si--) {
           const sub = subgroups[si];
           if (sub.length === 0) continue;
-          const subStart = sub[0].ordinal;
-          const subEnd = sub[sub.length - 1].ordinal;
-          const tokens = sub.reduce((sum, i) => sum + i.tokens, 0);
-          const sourceIds = sub.map((i) => String(i.messageId));
+
+          const tokens = sub.reduce((sum, item) => sum + item.tokens, 0);
+          const sourceIds = sub.map((item) => String(item.messageId));
 
           const pointerId = `ptr_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
-          const label = `${target === "tool_results" ? "Tool results" : "Messages"} (${sourceIds.length} items, ~${tokens} tokens)`;
+          const label = buildGroupLabel(sub, target);
+
+          // Determine source type from actual content
+          const hasToolMessages = sub.some((item) => item.role === "tool");
+          const sourceType = hasToolMessages ? "tool_output" : "messages";
 
           input.deps.log.info(
             `[lcm:tidy] Collapsing ${sub.length} item(s) → ${pointerId}, saving ~${tokens} tokens`,
@@ -279,16 +309,19 @@ export function createLcmTidyTool(input: {
             pointerId,
             conversationId,
             label,
-            sourceType: target === "tool_results" ? "tool_output" : "messages",
+            sourceType,
             sourceIds,
             tokensSaved: tokens,
             status: "reference",
           });
 
-          await summaryStore.replaceContextRangeWithPointer({
+          // Replace only the specific ordinals we're collapsing, not the full range.
+          // This avoids sweeping non-collapsible items (summaries, pointers, non-matching
+          // messages) that happen to fall between our target ordinals.
+          const ordinals = sub.map((item) => item.ordinal);
+          await summaryStore.replaceContextItemsWithPointer({
             conversationId,
-            startOrdinal: subStart,
-            endOrdinal: subEnd,
+            ordinals,
             pointerId,
           });
 
@@ -323,4 +356,37 @@ export function createLcmTidyTool(input: {
       return jsonResult(result);
     },
   };
+}
+
+/**
+ * Build a descriptive label for a group of collapsed items.
+ *
+ * For tool results: includes tool names (deduplicated).
+ * For conversation messages: includes a preview of the first user message.
+ */
+function buildGroupLabel(group: ResolvedMessage[], target: string): string {
+  const tokens = group.reduce((sum, item) => sum + item.tokens, 0);
+  const count = group.length;
+
+  if (target === "tool_results" || group.every((item) => item.role === "tool")) {
+    // Collect unique tool names
+    const toolNames = [...new Set(group.map((item) => item.toolName).filter(Boolean))] as string[];
+    if (toolNames.length > 0) {
+      const nameStr = toolNames.length <= 3
+        ? toolNames.join(", ")
+        : `${toolNames.slice(0, 3).join(", ")} +${toolNames.length - 3} more`;
+      return `Tool results: ${nameStr} (${count} items, ~${tokens} tokens)`;
+    }
+    return `Tool results (${count} items, ~${tokens} tokens)`;
+  }
+
+  // Conversation messages — find the first user message for context
+  const firstUser = group.find((item) => item.role === "user");
+  if (firstUser && firstUser.contentPreview) {
+    return `Discussion: "${truncate(firstUser.contentPreview, 60)}" (${count} items, ~${tokens} tokens)`;
+  }
+
+  // Fallback: list the roles present
+  const roles = [...new Set(group.map((item) => item.role))];
+  return `${roles.join("/")} messages (${count} items, ~${tokens} tokens)`;
 }
